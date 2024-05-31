@@ -1,18 +1,23 @@
 # To run: conda env create -f environment.yml
-name: ultra_nerf
+name: ultra_nerf_pytorch
+# allow use noarch and linux64
 channels:
     - conda-forge
+    - anaconda
+    - pytorch
 dependencies:
-    - python=3.7
+    - python==3.7
     - pip
     #- cudatoolkit=10.0
-    - tensorflow==1.15
-    - tensorflow-gpu==1.15
-    - tensorflow_probability==0.8.0
+    # - tensorflow~=1.15
+    # - tensorflow-gpu==1.15
+    # - tensorflow-probability~=0.8.0
     - jax
     - numpy
     - matplotlib
     - imageio==2.19.3
     - imageio-ffmpeg
     - configargparse
-    - imagemagick
+    - pytorch
+    - scikit-learn
+    # - imagemagick

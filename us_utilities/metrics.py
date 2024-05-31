@@ -1,176 +1,111 @@
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
 import math
-from sklearn.mixture import GaussianMixture as GMM
-from sklearn.cluster import KMeans as KMeans
-import jax
 
-import tensorflow.keras.backend as K
 EPS = 1.0e-7
 
-
 def mutualInformation(bin_centers,
-                      sigma_ratio=0.5,  # sigma for soft MI. If not provided, it will be half of a bin length
+                      sigma_ratio=0.5,
                       max_clip=1,
-                      crop_background=False,  # crop_background should never be true if local_mi is True
+                      crop_background=False,
                       local_mi=False,
-                      patch_size=1):
-    """
-    mutual information for image-image pairs.
-    Author: Courtney Guo. See thesis https://dspace.mit.edu/handle/1721.1/123142
-    """
-    print("vxm:mutual information loss is experimental.", file=sts.stderr)
-
+                      patch_size=1,
+                      vol_size=None):
     if local_mi:
-        return localMutualInformation(bin_centers, sigma_ratio, max_clip, patch_size)
-
+        return localMutualInformation(bin_centers, vol_size, sigma_ratio, max_clip, patch_size)
     else:
         return globalMutualInformation(bin_centers, sigma_ratio, max_clip, crop_background)
-
 
 def globalMutualInformation(bin_centers,
                             sigma_ratio=0.5,
                             max_clip=1,
                             crop_background=False):
-    """
-    Mutual Information for image-image pairs
-    Building from neuron.losses.MutualInformationSegmentation()
-    This function assumes that y_true and y_pred are both (batch_size x height x width x depth x nb_chanels)
-    Author: Courtney Guo. See thesis at https://dspace.mit.edu/handle/1721.1/123142
-    """
-    print("vxm:mutual information loss is experimental.", file=sts.stderr)
-
-    """ prepare MI. """
-    vol_bin_centers = K.variable(bin_centers)
+    vol_bin_centers = torch.tensor(bin_centers)
     num_bins = len(bin_centers)
     sigma = np.mean(np.diff(bin_centers)) * sigma_ratio
-
-    preterm = K.variable(1 / (2 * np.square(sigma)))
+    preterm = torch.tensor(1 / (2 * np.square(sigma)))
 
     def mi(y_true, y_pred):
-        """ soft mutual info """
-        y_pred = K.clip(y_pred, 0, max_clip)
-        y_true = K.clip(y_true, 0, max_clip)
+        y_pred = torch.clamp(y_pred, 0, max_clip)
+        y_true = torch.clamp(y_true, 0, max_clip)
 
         if crop_background:
-            # does not support variable batch size
             thresh = 0.0001
             padding_size = 20
-            filt = tf.ones([padding_size, padding_size, padding_size, 1, 1])
-
-            smooth = tf.nn.conv3d(y_true, filt, [1, 1, 1, 1, 1], "SAME")
+            filt = torch.ones(1, 1, padding_size, padding_size, padding_size).to(y_true.device)
+            smooth = F.conv3d(y_true, filt, padding=padding_size//2)
             mask = smooth > thresh
-            # mask = K.any(K.stack([y_true > thresh, y_pred > thresh], axis=0), axis=0)
-            y_pred = tf.boolean_mask(y_pred, mask)
-            y_true = tf.boolean_mask(y_true, mask)
-            y_pred = K.expand_dims(K.expand_dims(y_pred, 0), 2)
-            y_true = K.expand_dims(K.expand_dims(y_true, 0), 2)
-
+            y_pred = y_pred[mask]
+            y_true = y_true[mask]
+            y_pred = y_pred.view(1, -1, 1)
+            y_true = y_true.view(1, -1, 1)
         else:
-            # reshape: flatten images into shape (batch_size, heightxwidthxdepthxchan, 1)
-            y_true = K.reshape(y_true, (-1, K.prod(K.shape(y_true)[1:])))
-            y_true = K.expand_dims(y_true, 2)
-            y_pred = K.reshape(y_pred, (-1, K.prod(K.shape(y_pred)[1:])))
-            y_pred = K.expand_dims(y_pred, 2)
+            y_true = y_true.view(y_true.shape[0], -1, 1)
+            y_pred = y_pred.view(y_pred.shape[0], -1, 1)
 
-        nb_voxels = tf.cast(K.shape(y_pred)[1], tf.float32)
+        nb_voxels = torch.tensor(y_pred.shape[1], dtype=torch.float32, device=y_pred.device)
+        vbc = vol_bin_centers.view(1, 1, num_bins)
 
-        # reshape bin centers to be (1, 1, B)
-        o = [1, 1, np.prod(vol_bin_centers.get_shape().as_list())]
-        vbc = K.reshape(vol_bin_centers, o)
+        I_a = torch.exp(- preterm * torch.square(y_true - vbc))
+        I_a /= torch.sum(I_a, -1, keepdim=True)
 
-        # compute image terms
-        I_a = K.exp(- preterm * K.square(y_true - vbc))
-        I_a /= K.sum(I_a, -1, keepdims=True)
+        I_b = torch.exp(- preterm * torch.square(y_pred - vbc))
+        I_b /= torch.sum(I_b, -1, keepdim=True)
 
-        I_b = K.exp(- preterm * K.square(y_pred - vbc))
-        I_b /= K.sum(I_b, -1, keepdims=True)
+        I_a_permute = I_a.permute(0, 2, 1)
+        pab = torch.bmm(I_a_permute, I_b) / nb_voxels
+        pa = torch.mean(I_a, 1, keepdim=True)
+        pb = torch.mean(I_b, 1, keepdim=True)
 
-        # compute probabilities
-        I_a_permute = K.permute_dimensions(I_a, (0, 2, 1))
-        pab = K.batch_dot(I_a_permute, I_b)  # should be the right size now, nb_labels x nb_bins
-        pab /= nb_voxels
-        pa = tf.reduce_mean(I_a, 1, keep_dims=True)
-        pb = tf.reduce_mean(I_b, 1, keep_dims=True)
-
-        papb = K.batch_dot(K.permute_dimensions(pa, (0, 2, 1)), pb) + K.epsilon()
-        mi = K.sum(K.sum(pab * K.log(pab / papb + K.epsilon()), 1), 1)
+        papb = torch.bmm(pa.permute(0, 2, 1), pb) + EPS
+        mi = torch.sum(pab * torch.log(pab / papb + EPS), dim=[1, 2])
 
         return mi
 
     def loss(y_true, y_pred):
-        return -mi(y_true, y_pred)
+        return -mi(y_true, y_pred).mean()
 
     return loss
 
-
-def localMutualInformation(bin_centers,
-                           vol_size,
-                           sigma_ratio=0.5,
-                           max_clip=1,
-                           patch_size=1):
-    """
-    Local Mutual Information for image-image pairs
-    # vol_size is something like (160, 192, 224)
-    This function assumes that y_true and y_pred are both (batch_sizexheightxwidthxdepthxchan)
-    Author: Courtney Guo. See thesis at https://dspace.mit.edu/handle/1721.1/123142
-    """
-    print("vxm:mutual information loss is experimental.", file=sts.stderr)
-
-    """ prepare MI. """
-    vol_bin_centers = K.variable(bin_centers)
+def localMutualInformation(bin_centers, vol_size, sigma_ratio=0.5, max_clip=1, patch_size=1):
+    vol_bin_centers = torch.tensor(bin_centers)
     num_bins = len(bin_centers)
     sigma = np.mean(np.diff(bin_centers)) * sigma_ratio
-
-    preterm = K.variable(1 / (2 * np.square(sigma)))
+    preterm = torch.tensor(1 / (2 * np.square(sigma)))
 
     def local_mi(y_true, y_pred):
-        y_pred = K.clip(y_pred, 0, max_clip)
-        y_true = K.clip(y_true, 0, max_clip)
+        y_pred = torch.clamp(y_pred, 0, max_clip)
+        y_true = torch.clamp(y_true, 0, max_clip)
+        vbc = vol_bin_centers.view(1, 1, 1, 1, num_bins)
 
-        # reshape bin centers to be (1, 1, B)
-        o = [1, 1, 1, 1, num_bins]
-        vbc = K.reshape(vol_bin_centers, o)
-
-        # compute padding sizes
         x, y, z = vol_size
         x_r = -x % patch_size
         y_r = -y % patch_size
         z_r = -z % patch_size
-        pad_dims = [[0, 0]]
-        pad_dims.append([x_r // 2, x_r - x_r // 2])
-        pad_dims.append([y_r // 2, y_r - y_r // 2])
-        pad_dims.append([z_r // 2, z_r - z_r // 2])
-        pad_dims.append([0, 0])
-        padding = tf.constant(pad_dims)
+        pad_dims = [(x_r // 2, x_r - x_r // 2), (y_r // 2, y_r - y_r // 2), (z_r // 2, z_r - z_r // 2)]
+        padding = [(0, 0), *pad_dims, (0, 0)]
+        padding = [item for sublist in padding for item in sublist]
 
-        # compute image terms
-        # num channels of y_true and y_pred must be 1
-        I_a = K.exp(- preterm * K.square(tf.pad(y_true, padding, 'CONSTANT') - vbc))
-        I_a /= K.sum(I_a, -1, keepdims=True)
+        I_a = torch.exp(- preterm * torch.square(F.pad(y_true, padding, 'constant') - vbc))
+        I_a /= torch.sum(I_a, -1, keepdim=True)
 
-        I_b = K.exp(- preterm * K.square(tf.pad(y_pred, padding, 'CONSTANT') - vbc))
-        I_b /= K.sum(I_b, -1, keepdims=True)
+        I_b = torch.exp(- preterm * torch.square(F.pad(y_pred, padding, 'constant') - vbc))
+        I_b /= torch.sum(I_b, -1, keepdim=True)
 
-        I_a_patch = tf.reshape(I_a, [(x + x_r) // patch_size, patch_size, (y + y_r) // patch_size, patch_size,
-                                     (z + z_r) // patch_size, patch_size, num_bins])
-        I_a_patch = tf.transpose(I_a_patch, [0, 2, 4, 1, 3, 5, 6])
-        I_a_patch = tf.reshape(I_a_patch, [-1, patch_size ** 3, num_bins])
+        I_a_patch = I_a.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size).unfold(4, patch_size, patch_size)
+        I_a_patch = I_a_patch.permute(0, 2, 3, 4, 1, 5, 6).reshape(-1, patch_size ** 3, num_bins)
 
-        I_b_patch = tf.reshape(I_b, [(x + x_r) // patch_size, patch_size, (y + y_r) // patch_size, patch_size,
-                                     (z + z_r) // patch_size, patch_size, num_bins])
-        I_b_patch = tf.transpose(I_b_patch, [0, 2, 4, 1, 3, 5, 6])
-        I_b_patch = tf.reshape(I_b_patch, [-1, patch_size ** 3, num_bins])
+        I_b_patch = I_b.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size).unfold(4, patch_size, patch_size)
+        I_b_patch = I_b_patch.permute(0, 2, 3, 4, 1, 5, 6).reshape(-1, patch_size ** 3, num_bins)
 
-        # compute probabilities
-        I_a_permute = K.permute_dimensions(I_a_patch, (0, 2, 1))
-        pab = K.batch_dot(I_a_permute, I_b_patch)  # should be the right size now, nb_labels x nb_bins
-        pab /= patch_size ** 3
-        pa = tf.reduce_mean(I_a_patch, 1, keep_dims=True)
-        pb = tf.reduce_mean(I_b_patch, 1, keep_dims=True)
+        I_a_permute = I_a_patch.permute(0, 2, 1)
+        pab = torch.bmm(I_a_permute, I_b_patch) / (patch_size ** 3)
+        pa = torch.mean(I_a_patch, 1, keepdim=True)
+        pb = torch.mean(I_b_patch, 1, keepdim=True)
 
-        papb = K.batch_dot(K.permute_dimensions(pa, (0, 2, 1)), pb) + K.epsilon()
-        mi = K.mean(K.sum(K.sum(pab * K.log(pab / papb + K.epsilon()), 1), 1))
+        papb = torch.bmm(pa.permute(0, 2, 1), pb) + EPS
+        mi = torch.mean(torch.sum(pab * torch.log(pab / papb + EPS), dim=[1, 2]))
 
         return mi
 
@@ -179,101 +114,60 @@ def localMutualInformation(bin_centers,
 
     return loss
 
-
 def fit_kmeans_sklearn(image_data, n_clusters=5):
-    org_shape = tf.shape(image_data)
-    image_data = jax.numpy.array(image_data).reshape((-1, 1))
-    print(f"DEVICE: {image_data.device_buffer.device()}")
+    from sklearn.cluster import KMeans
+    image_data = image_data.reshape((-1, 1))
     k_means = KMeans(init="k-means++", n_clusters=n_clusters, n_init=1, max_iter=5)
     k_means.fit(image_data)
+    return k_means
 
-    return
-def fit_kmeans_tensor(image_data, k_means, iter=100):
-    org_shape = tf.shape(image_data)
-    att_to_km = np.array(image_data).reshape((-1, 1))
-    def input_fn():
-        data_tensor = tf.convert_to_tensor(att_to_km, dtype=tf.float32)
-
-        return tf.compat.v1.train.limit_epochs(data_tensor,
-                                               num_epochs=1)
-    num_iterations = iter
-    # previous_centers = None
+def fit_kmeans_tensor(image_data, k_means, num_iterations=100):
+    image_data = image_data.numpy().reshape((-1, 1))
     for _ in range(num_iterations):
-        k_means.train(input_fn)
-        cluster_centers = k_means.cluster_centers()
-        # if previous_centers is not None:
-        #     print('delta:', cluster_centers - previous_centers)
-        previous_centers = cluster_centers
-    #     print('score:', k_means.score(input_fn))
-    # print('cluster centers:', cluster_centers)
-
-    labels = k_means.predict_cluster_index(input_fn)
-    cluster_centers = k_means.cluster_centers()
-
-    return tf.reshape(labels, org_shape), cluster_centers
+        k_means.partial_fit(image_data)
+    labels = k_means.predict(image_data)
+    cluster_centers = k_means.cluster_centers_
+    return labels.reshape(image_data.shape), cluster_centers
 
 def fit_gmm(image_data, n_components=6):
+    from sklearn.mixture import GaussianMixture as GMM
     org_shape = image_data.shape
     image_data = image_data.reshape((-1, 1))
-    gmm_model = GMM(n_components=n_components, covariance_type='full').fit(image_data)  # tied works better than full
+    gmm_model = GMM(n_components=n_components, covariance_type='full').fit(image_data)
     gmm_labels = gmm_model.predict(image_data)
     gmm_labels = gmm_labels.reshape(org_shape)
-
     return gmm_labels, gmm_model.means_
 
-
-def separable_filter(tensor: tf.Tensor, kernel: tf.Tensor) -> tf.Tensor:
+def separable_filter(tensor: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     """
-    Create a 3d separable filter.
-    Here `tf.nn.conv3d` accepts the `filters` argument of shape
-    (filter_depth, filter_height, filter_width, in_channels, out_channels),
-    where the first axis of `filters` is the depth not batch,
-    and the input to `tf.nn.conv3d` is of shape
-    (batch, in_depth, in_height, in_width, in_channels).
+    Create a 3d separable filter in PyTorch.
     :param tensor: shape = (batch, dim1, dim2, dim3, 1)
     :param kernel: shape = (dim4,)
     :return: shape = (batch, dim1, dim2, dim3, 1)
     """
-    strides = [1, 1, 1, 1, 1]
-    kernel = tf.cast(kernel, dtype=tensor.dtype)
+    kernel = kernel.to(tensor.dtype)
+    kernel = kernel.view(-1, 1, 1, 1, 1)
 
-    tensor = tf.nn.conv3d(
-        tf.nn.conv3d(
-            tf.nn.conv3d(
-                tensor,
-                filters=tf.reshape(kernel, [-1, 1, 1, 1, 1]),
-                strides=strides,
-                padding="SAME",
-            ),
-            filters=tf.reshape(kernel, [1, -1, 1, 1, 1]),
-            strides=strides,
-            padding="SAME",
-        ),
-        filters=tf.reshape(kernel, [1, 1, -1, 1, 1]),
-        strides=strides,
-        padding="SAME",
-    )
+    tensor = F.conv3d(tensor, kernel, padding=0)
+    kernel = kernel.view(1, -1, 1, 1, 1)
+    tensor = F.conv3d(tensor, kernel, padding=0)
+    kernel = kernel.view(1, 1, -1, 1, 1)
+    tensor = F.conv3d(tensor, kernel, padding=0)
+
     return tensor
 
-
-def rectangular_kernel1d(kernel_size: int) -> tf.Tensor:
+def rectangular_kernel1d(kernel_size: int) -> torch.Tensor:
     """
-    Return a the 1D rectangular kernel for LocalNormalizedCrossCorrelation.
+    Return a 1D rectangular kernel for LocalNormalizedCrossCorrelation.
     :param kernel_size: scalar, size of the 1-D kernel
     :return: kernel_weights, of shape (kernel_size, )
     """
-
-    kernel = tf.ones(shape=(kernel_size,), dtype=tf.float32)
+    kernel = torch.ones(kernel_size, dtype=torch.float32)
     return kernel
 
-
-def triangular_kernel1d(kernel_size: int) -> tf.Tensor:
+def triangular_kernel1d(kernel_size: int) -> torch.Tensor:
     """
-    Return a the 1D triangular kernel for LocalNormalizedCrossCorrelation.
-    Assume kernel_size is odd, it will be a smoothed from
-    a kernel which center part is zero.
-    Then length of the ones will be around half kernel_size.
-    The weight scale of the kernel does not matter as LNCC will normalize it.
+    Return a 1D triangular kernel for LocalNormalizedCrossCorrelation.
     :param kernel_size: scalar, size of the 1-D kernel
     :return: kernel_weights, of shape (kernel_size, )
     """
@@ -281,71 +175,57 @@ def triangular_kernel1d(kernel_size: int) -> tf.Tensor:
     assert kernel_size % 2 != 0
 
     padding = kernel_size // 2
-    kernel = tf.constant(
-        [0] * math.ceil(padding / 2)
-        + [1] * (kernel_size - padding)
-        + [0] * math.floor(padding / 2),
-        dtype=tf.float32,
+    kernel = torch.tensor(
+        [0] * math.ceil(padding / 2) + [1] * (kernel_size - padding) + [0] * math.floor(padding / 2),
+        dtype=torch.float32
     )
 
-    # (padding*2, )
-    filters = tf.ones(shape=(kernel_size - padding, 1, 1), dtype=tf.float32)
+    filters = torch.ones((kernel_size - padding, 1, 1), dtype=torch.float32)
 
-    # (kernel_size, 1, 1)
-    kernel = tf.nn.conv1d(
-        kernel[None, :, None], filters=filters, stride=[1, 1, 1], padding="SAME"
-    )
+    kernel = F.conv1d(kernel.view(1, 1, -1), filters, padding="same")
+    return kernel.view(-1)
 
-    return kernel[0, :, 0]
-
-
-def gaussian_kernel1d(kernel_size: int) -> tf.Tensor:
+def gaussian_kernel1d(kernel_size: int) -> torch.Tensor:
     """
-    Return a the 1D Gaussian kernel for LocalNormalizedCrossCorrelation.
+    Return a 1D Gaussian kernel for LocalNormalizedCrossCorrelation.
     :param kernel_size: scalar, size of the 1-D kernel
     :return: filters, of shape (kernel_size, )
     """
     mean = (kernel_size - 1) / 2.0
     sigma = kernel_size / 3
 
-    grid = tf.range(0, kernel_size, dtype=tf.float32)
-    filters = tf.exp(-tf.square(grid - mean) / (2 * sigma ** 2))
+    grid = torch.arange(0, kernel_size, dtype=torch.float32)
+    filters = torch.exp(-torch.square(grid - mean) / (2 * sigma ** 2))
 
     return filters
 
-
-def gaussian_kernel1d_sigma(sigma: int) -> tf.Tensor:
+def gaussian_kernel1d_sigma(sigma: int) -> torch.Tensor:
     """
-    Calculate a gaussian kernel.
-    :param sigma: number defining standard deviation for
-                  gaussian kernel.
+    Calculate a Gaussian kernel.
+    :param sigma: number defining standard deviation for Gaussian kernel.
     :return: shape = (dim, )
     """
     assert sigma > 0
     tail = int(sigma * 3)
-    kernel = tf.exp([-0.5 * x ** 2 / sigma ** 2 for x in range(-tail, tail + 1)])
-    kernel = kernel / tf.reduce_sum(kernel)
+    kernel = torch.exp(-0.5 * torch.square(torch.arange(-tail, tail + 1, dtype=torch.float32)) / sigma ** 2)
+    kernel = kernel / torch.sum(kernel)
     return kernel
 
-
-def cauchy_kernel1d(sigma: int) -> tf.Tensor:
+def cauchy_kernel1d(sigma: int) -> torch.Tensor:
     """
-    Approximating cauchy kernel in 1d.
+    Approximating Cauchy kernel in 1D.
     :param sigma: int, defining standard deviation of kernel.
     :return: shape = (dim, )
     """
     assert sigma > 0
     tail = int(sigma * 5)
-    k = tf.math.reciprocal([((x / sigma) ** 2 + 1) for x in range(-tail, tail + 1)])
-    k = k / tf.reduce_sum(k)
+    k = 1 / ((torch.arange(-tail, tail + 1, dtype=torch.float32) / sigma) ** 2 + 1)
+    k = k / torch.sum(k)
     return k
-
-
 
 def _hgram(img_l, img_r):
     hgram, _, _ = np.histogram2d(img_l.ravel(), img_r.ravel())
     return hgram
-
 
 def _mutual_information(hgram):
     pxy = hgram / float(np.sum(hgram))
@@ -356,10 +236,8 @@ def _mutual_information(hgram):
 
     return np.sum(pxy[nzs] * np.log(pxy[nzs] / px_py[nzs]))
 
-
 def mi(img_l, img_r):
     return _mutual_information(_hgram(img_l, img_r))
-
 class NCC:
     """
     Local (over window) normalized cross correlation loss.
@@ -372,8 +250,7 @@ class NCC:
 
     def ncc(self, Ii, Ji):
         # get dimension of volume
-        # assumes Ii, Ji are sized [batch_size, *vol_shape, nb_feats]
-        ndims = len(Ii.get_shape().as_list()) - 2
+        ndims = Ii.ndim - 2
         assert ndims in [1, 2, 3], "volumes should be 1 to 3 dimensions. found: %d" % ndims
 
         # set window size
@@ -382,46 +259,39 @@ class NCC:
         elif not isinstance(self.win, list):  # user specified a single number not a list
             self.win = [self.win] * ndims
 
-        # get convolution function
-        conv_fn = getattr(tf.nn, 'conv%dd' % ndims)
-
         # compute CC squares
         I2 = Ii * Ii
         J2 = Ji * Ji
         IJ = Ii * Ji
 
         # compute filters
-        in_ch = Ji.get_shape().as_list()[-1]
-        sum_filt = tf.ones([*self.win, in_ch, 1])
-        strides = 1
-        if ndims > 1:
-            strides = [1] * (ndims + 2)
+        in_ch = Ji.shape[-1]
+        sum_filt = torch.ones([1, 1, *self.win]).to(Ii.device) / np.prod(self.win)
+        strides = [1] * (ndims + 2)
 
         # compute local sums via convolution
-        padding = 'SAME'
-        I_sum = conv_fn(Ii, sum_filt, strides, padding)
-        J_sum = conv_fn(Ji, sum_filt, strides, padding)
-        I2_sum = conv_fn(I2, sum_filt, strides, padding)
-        J2_sum = conv_fn(J2, sum_filt, strides, padding)
-        IJ_sum = conv_fn(IJ, sum_filt, strides, padding)
+        padding = 'same'
+        I_sum = F.conv2d(Ii.permute(0, 4, 1, 2, 3).reshape(-1, 1, *Ii.shape[1:-1]), sum_filt, padding=padding).reshape(Ii.shape[0], -1, *Ii.shape[1:-1]).permute(0, 2, 3, 4, 1)
+        J_sum = F.conv2d(Ji.permute(0, 4, 1, 2, 3).reshape(-1, 1, *Ji.shape[1:-1]), sum_filt, padding=padding).reshape(Ji.shape[0], -1, *Ji.shape[1:-1]).permute(0, 2, 3, 4, 1)
+        I2_sum = F.conv2d(I2.permute(0, 4, 1, 2, 3).reshape(-1, 1, *I2.shape[1:-1]), sum_filt, padding=padding).reshape(I2.shape[0], -1, *I2.shape[1:-1]).permute(0, 2, 3, 4, 1)
+        J2_sum = F.conv2d(J2.permute(0, 4, 1, 2, 3).reshape(-1, 1, *J2.shape[1:-1]), sum_filt, padding=padding).reshape(J2.shape[0], -1, *J2.shape[1:-1]).permute(0, 2, 3, 4, 1)
+        IJ_sum = F.conv2d(IJ.permute(0, 4, 1, 2, 3).reshape(-1, 1, *IJ.shape[1:-1]), sum_filt, padding=padding).reshape(IJ.shape[0], -1, *IJ.shape[1:-1]).permute(0, 2, 3, 4, 1)
 
         # compute cross correlation
         win_size = np.prod(self.win) * in_ch
         u_I = I_sum / win_size
         u_J = J_sum / win_size
 
-        # TODO: simplify this
         cross = IJ_sum - u_J * I_sum - u_I * J_sum + u_I * u_J * win_size
-        cross = tf.maximum(cross, self.eps)
+        cross = torch.maximum(cross, torch.tensor(self.eps, device=cross.device))
         I_var = I2_sum - 2 * u_I * I_sum + u_I * u_I * win_size
-        I_var = tf.maximum(I_var, self.eps)
+        I_var = torch.maximum(I_var, torch.tensor(self.eps, device=I_var.device))
         J_var = J2_sum - 2 * u_J * J_sum + u_J * u_J * win_size
-        J_var = tf.maximum(J_var, self.eps)
+        J_var = torch.maximum(J_var, torch.tensor(self.eps, device=J_var.device))
 
         if self.signed:
-            cc = cross / tf.sqrt(I_var * J_var + self.eps)
+            cc = cross / torch.sqrt(I_var * J_var + self.eps)
         else:
-            # cc = (cross * cross) / (I_var * J_var)
             cc = (cross / I_var) * (cross / J_var)
 
         return cc
@@ -431,64 +301,32 @@ class NCC:
         cc = self.ncc(y_true, y_pred)
         # reduce
         if reduce == 'mean':
-            cc = tf.reduce_mean(K.batch_flatten(cc), axis=-1)
+            cc = torch.mean(cc)
         elif reduce == 'max':
-            cc = tf.reduce_max(K.batch_flatten(cc), axis=-1)
+            cc = torch.max(cc)
         elif reduce is not None:
             raise ValueError(f'Unknown NCC reduction type: {reduce}')
         # loss
         return -cc
 
-class LocalNormalizedCrossCorrelation(tf.keras.losses.Loss):
+class LocalNormalizedCrossCorrelation(torch.nn.Module):
     """
     Local squared zero-normalized cross-correlation.
-    Denote y_true as t and y_pred as p. Consider a window having n elements.
-    Each position in the window corresponds a weight w_i for i=1:n.
-    Define the discrete expectation in the window E[t] as
-        E[t] = sum_i(w_i * t_i) / sum_i(w_i)
-    Similarly, the discrete variance in the window V[t] is
-        V[t] = E[t**2] - E[t] ** 2
-    The local squared zero-normalized cross-correlation is therefore
-        E[ (t-E[t]) * (p-E[p]) ] ** 2 / V[t] / V[p]
-    where the expectation in numerator is
-        E[ (t-E[t]) * (p-E[p]) ] = E[t * p] - E[t] * E[p]
-    Different kernel corresponds to different weights.
-    For now, y_true and y_pred have to be at least 4d tensor, including batch axis.
-    Reference:
-        - Zero-normalized cross-correlation (ZNCC):
-            https://en.wikipedia.org/wiki/Cross-correlation
-        - Code: https://github.com/voxelmorph/voxelmorph/blob/legacy/src/losses.py
     """
 
-    kernel_fn_dict = dict(
-        gaussian=gaussian_kernel1d,
-        rectangular=rectangular_kernel1d,
-        triangular=triangular_kernel1d,
-    )
+    kernel_fn_dict = {
+        'gaussian': gaussian_kernel1d,
+        'rectangular': rectangular_kernel1d,
+        'triangular': triangular_kernel1d,
+    }
 
-    def __init__(
-        self,
-        kernel_size: int = 9,
-        kernel_type: str = "rectangular",
-        smooth_nr: float = EPS,
-        smooth_dr: float = EPS,
-        name: str = "LocalNormalizedCrossCorrelation",
-        **kwargs,
-    ):
-        """
-        Init.
-        :param kernel_size: int. Kernel size or kernel sigma for kernel_type='gauss'.
-        :param kernel_type: str, rectangular, triangular or gaussian
-        :param smooth_nr: small constant added to numerator in case of zero covariance.
-        :param smooth_dr: small constant added to denominator in case of zero variance.
-        :param name: name of the loss.
-        :param kwargs: additional arguments.
-        """
-        super().__init__(name=name, **kwargs)
-        if kernel_type not in self.kernel_fn_dict.keys():
+    def __init__(self, kernel_size: int = 9, kernel_type: str = "rectangular",
+                 smooth_nr: float = 1e-5, smooth_dr: float = 1e-5):
+        super().__init__()
+        if kernel_type not in self.kernel_fn_dict:
             raise ValueError(
                 f"Wrong kernel_type {kernel_type} for LNCC loss type. "
-                f"Feasible values are {self.kernel_fn_dict.keys()}"
+                f"Feasible values are {list(self.kernel_fn_dict.keys())}"
             )
         self.kernel_fn = self.kernel_fn_dict[kernel_type]
         self.kernel_type = kernel_type
@@ -496,97 +334,57 @@ class LocalNormalizedCrossCorrelation(tf.keras.losses.Loss):
         self.smooth_nr = smooth_nr
         self.smooth_dr = smooth_dr
 
-        # (kernel_size, )
         self.kernel = self.kernel_fn(kernel_size=self.kernel_size)
-        # E[1] = sum_i(w_i), ()
-        self.kernel_vol = tf.reduce_sum(
+        self.kernel_vol = torch.sum(
             self.kernel[:, None, None]
             * self.kernel[None, :, None]
             * self.kernel[None, None, :]
         )
 
-    def calc_ncc(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """
-        Return NCC for a batch.
-        The kernel should not be normalized, as normalizing them leads to computation
-        with small values and the precision will be reduced.
-        Here both numerator and denominator are actually multiplied by kernel volume,
-        which helps the precision as well.
-        However, when the variance is zero, the obtained value might be negative due to
-        machine error. Therefore a hard-coded clipping is added to
-        prevent division by zero.
-        :param y_true: shape = (batch, dim1, dim2, dim3, 1)
-        :param y_pred: shape = (batch, dim1, dim2, dim3, 1)
-        :return: shape = (batch, dim1, dim2, dim3. 1)
-        """
-
-        # t = y_true, p = y_pred
-        # (batch, dim1, dim2, dim3, 1)
+    def calc_ncc(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
         t2 = y_true * y_true
         p2 = y_pred * y_pred
         tp = y_true * y_pred
 
-        # sum over kernel
-        # (batch, dim1, dim2, dim3, 1)
-        t_sum = separable_filter(y_true, kernel=self.kernel)  # E[t] * E[1]
-        p_sum = separable_filter(y_pred, kernel=self.kernel)  # E[p] * E[1]
-        t2_sum = separable_filter(t2, kernel=self.kernel)  # E[tt] * E[1]
-        p2_sum = separable_filter(p2, kernel=self.kernel)  # E[pp] * E[1]
-        tp_sum = separable_filter(tp, kernel=self.kernel)  # E[tp] * E[1]
+        t_sum = separable_filter(y_true, kernel=self.kernel)
+        p_sum = separable_filter(y_pred, kernel=self.kernel)
+        t2_sum = separable_filter(t2, kernel=self.kernel)
+        p2_sum = separable_filter(p2, kernel=self.kernel)
+        tp_sum = separable_filter(tp, kernel=self.kernel)
 
-        # average over kernel
-        # (batch, dim1, dim2, dim3, 1)
-        t_avg = t_sum / self.kernel_vol  # E[t]
-        p_avg = p_sum / self.kernel_vol  # E[p]
+        t_avg = t_sum / self.kernel_vol
+        p_avg = p_sum / self.kernel_vol
 
-        # shape = (batch, dim1, dim2, dim3, 1)
-        cross = tp_sum - p_avg * t_sum  # E[tp] * E[1] - E[p] * E[t] * E[1]
-        t_var = t2_sum - t_avg * t_sum  # V[t] * E[1]
-        p_var = p2_sum - p_avg * p_sum  # V[p] * E[1]
+        cross = tp_sum - p_avg * t_sum
+        t_var = t2_sum - t_avg * t_sum
+        p_var = p2_sum - p_avg * p_sum
 
-        # ensure variance >= 0
-        t_var = tf.maximum(t_var, 0)
-        p_var = tf.maximum(p_var, 0)
+        t_var = torch.clamp(t_var, min=0)
+        p_var = torch.clamp(p_var, min=0)
 
-        # (E[tp] - E[p] * E[t]) ** 2 / V[t] / V[p]
         ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
 
         return ncc
 
-    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """
-        Return loss for a batch.
-        TODO: support channel axis dimension > 1.
-        :param y_true: shape = (batch, dim1, dim2, dim3)
-            or (batch, dim1, dim2, dim3, 1)
-        :param y_pred: shape = (batch, dim1, dim2, dim3)
-            or (batch, dim1, dim2, dim3, 1)
-        :return: shape = (batch,)
-        """
-        # sanity checks
-        if len(y_true.shape) == 4:
-            y_true = tf.expand_dims(y_true, axis=4)
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        if y_true.ndim == 4:
+            y_true = y_true.unsqueeze(4)
         if y_true.shape[4] != 1:
-            raise ValueError(
-                "Last dimension of y_true is not one. " f"y_true.shape = {y_true.shape}"
-            )
-        if len(y_pred.shape) == 4:
-            y_pred = tf.expand_dims(y_pred, axis=4)
+            raise ValueError(f"Last dimension of y_true is not one. y_true.shape = {y_true.shape}")
+
+        if y_pred.ndim == 4:
+            y_pred = y_pred.unsqueeze(4)
         if y_pred.shape[4] != 1:
-            raise ValueError(
-                "Last dimension of y_pred is not one. " f"y_pred.shape = {y_pred.shape}"
-            )
+            raise ValueError(f"Last dimension of y_pred is not one. y_pred.shape = {y_pred.shape}")
 
-        ncc = self.calc_ncc(y_true=y_true, y_pred=y_pred)
-        return tf.reduce_mean(ncc, axis=[1, 2, 3, 4])
+        ncc = self.calc_ncc(y_true, y_pred)
+        return torch.mean(ncc, dim=[1, 2, 3, 4])
 
-    def get_config(self) -> dict:
-        """Return the config dictionary for recreating this class."""
-        config = super().get_config()
-        config.update(
-            kernel_size=self.kernel_size,
-            kernel_type=self.kernel_type,
-            smooth_nr=self.smooth_nr,
-            smooth_dr=self.smooth_dr,
-        )
+    def get_config(self):
+        config = {
+            "kernel_size": self.kernel_size,
+            "kernel_type": self.kernel_type,
+            "smooth_nr": self.smooth_nr,
+            "smooth_dr": self.smooth_dr,
+        }
         return config
